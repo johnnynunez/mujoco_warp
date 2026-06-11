@@ -53,6 +53,7 @@ from mujoco_warp._src.grad import diff_step as diff_step
 from mujoco_warp._src.grad import disable_grad as disable_grad
 from mujoco_warp._src.grad import enable_grad as enable_grad
 from mujoco_warp._src.grad import make_diff_data as make_diff_data
+from mujoco_warp._src.grad_contact import solve_ift_backward as solve_ift_backward
 from mujoco_warp._src.history import init_ctrl_history as init_ctrl_history
 from mujoco_warp._src.history import init_sensor_history as init_sensor_history
 from mujoco_warp._src.history import read_ctrl as read_ctrl
