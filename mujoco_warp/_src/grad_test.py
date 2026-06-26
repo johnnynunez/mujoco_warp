@@ -13,6 +13,7 @@ if _src_dir in _sys.path:
 
 import mujoco
 import numpy as np
+import pytest
 import warp as wp
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -670,6 +671,18 @@ def _sum_qpos_kernel(
 ):
   worldid, qid = wp.tid()
   wp.atomic_add(loss, 0, qpos_in[worldid, qid])
+
+
+@wp.kernel
+def _sum_qpos_sq_kernel(
+  # Data in:
+  qpos_in: wp.array2d[float],
+  # In:
+  loss: wp.array[float],
+):
+  worldid, qid = wp.tid()
+  v = qpos_in[worldid, qid]
+  wp.atomic_add(loss, 0, v * v)
 
 
 class GradSolverAdjointTest(parameterized.TestCase):
@@ -1338,6 +1351,94 @@ class GradFlexTest(parameterized.TestCase):
       cm[i] -= eps
       fd_grad[i] = (eval_loss(cp) - eval_loss(cm)) / (2 * eps)
     np.testing.assert_allclose(ad_grad, fd_grad, atol=1e-3, rtol=1e-3, err_msg="spatial tendon grad mismatch")
+
+
+# Multi-step rollout through a persistent contact: a body resting on the floor, actuated
+# upward, so the floor contact is active and the control affects the loss *through* that
+# contact across many steps. This is the regime gradient-based policy optimization (e.g.
+# SHAC) actually uses, and it is not covered by the single-step contact tests above.
+_CONTACT_MULTISTEP_XML = """
+<mujoco>
+  <option timestep="0.005" gravity="0 0 -9.81" jacobian="sparse" solver="Newton" iterations="30">
+    <flag eulerdamp="disable"/>
+  </option>
+  <worldbody>
+    <geom type="plane" size="5 5 0.01"/>
+    <body pos="0 0 0.09">
+      <joint name="slide" type="slide" axis="0 0 1"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="slide" gear="1"/>
+  </actuator>
+</mujoco>
+"""
+
+
+class GradContactMultiStepTest(parameterized.TestCase):
+  """Regression: dL/dctrl through a multi-step rollout with an active contact.
+
+  Tracks the known issue that reverse-mode gradients through a persistent contact over a
+  multi-step rollout disagree with finite differences (direction and magnitude), which
+  breaks first-order policy optimization (SHAC-style) on contact-rich tasks like hopper or
+  cheetah, even though single-step contact gradients (the tests above) pass. See the
+  diagnosis writeup accompanying this branch. Marked xfail (non-strict) so it documents the
+  regression without breaking CI, and so it will start passing automatically once the
+  contact/integrator adjoint is fixed.
+  """
+
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
+  @parameterized.parameters(5, 20)
+  def test_multistep_contact_ad_matches_fd(self, nsteps):
+    mjm = mujoco.MjModel.from_xml_string(_CONTACT_MULTISTEP_XML)
+    nu = mjm.nu
+
+    def eval_loss(ctrl_np):
+      _, _, m_fd, d_fd = test_data.fixture(xml=_CONTACT_MULTISTEP_XML)
+      mjw.reset_data(m_fd, d_fd)
+      d_fd.ctrl = wp.array(ctrl_np.reshape(1, -1), dtype=float)
+      for _ in range(nsteps):
+        wp.copy(d_fd.ctrl, wp.array(ctrl_np.reshape(1, -1), dtype=float))
+        mjw.step(m_fd, d_fd)
+      q = d_fd.qpos.numpy()[0]
+      return float(np.sum(q * q))
+
+    # AD gradient through the multi-step rollout.
+    _, _, m, d = test_data.fixture(xml=_CONTACT_MULTISTEP_XML)
+    enable_grad(d)
+    ctrl0 = np.full(nu, 0.2, dtype=np.float32)
+    ctrl = wp.array(ctrl0.reshape(1, -1), dtype=float, requires_grad=True)
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      for _ in range(nsteps):
+        wp.copy(d.ctrl, ctrl)
+        mjw.step(m, d)
+      wp.launch(_sum_qpos_sq_kernel, dim=(d.nworld, mjm.nq), inputs=[d.qpos, loss])
+    tape.backward(loss=loss)
+    ad_grad = np.nan_to_num(ctrl.grad.numpy()[0, :nu].copy())
+    tape.zero()
+
+    # Finite-difference reference.
+    eps = 1e-3
+    fd_grad = np.zeros(nu)
+    for i in range(nu):
+      cp = ctrl0.copy()
+      cp[i] += eps
+      cm = ctrl0.copy()
+      cm[i] -= eps
+      fd_grad[i] = (eval_loss(cp) - eval_loss(cm)) / (2 * eps)
+
+    # Require the AD gradient to point the same way as FD and be similarly scaled.
+    cos = float(np.dot(ad_grad, fd_grad) / (np.linalg.norm(ad_grad) * np.linalg.norm(fd_grad) + 1e-12))
+    ratio = float(np.linalg.norm(ad_grad) / (np.linalg.norm(fd_grad) + 1e-12))
+    ok = cos > 0.9 and 0.5 < ratio < 2.0
+    if not ok:
+      # Known regression: contact/integrator adjoint gives wrong multi-step gradients.
+      # Documented as xfail so CI stays green; will xpass once fixed.
+      pytest.xfail(f"contact multi-step AD/FD mismatch (nsteps={nsteps}, cos={cos:.3f}, ratio={ratio:.2f})")
+    np.testing.assert_allclose(ad_grad, fd_grad, atol=1e-3, rtol=0.5, err_msg="multi-step contact grad mismatch")
 
 
 if __name__ == "__main__":
