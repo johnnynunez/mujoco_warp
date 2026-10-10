@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for GPU determinism (contact sorting, constraint rows, full-pipeline bitwise stability)."""
+"""Heightfield replay regression across batch sizes and independent initializations."""
 
 import mujoco
 import numpy as np
