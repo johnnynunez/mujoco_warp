@@ -14,8 +14,6 @@
 # ==============================================================================
 """Tests for GPU determinism (contact sorting, constraint rows, full-pipeline bitwise stability)."""
 
-import hashlib
-
 import mujoco
 import numpy as np
 import warp as wp
